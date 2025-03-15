@@ -30,17 +30,13 @@ async function getTools() {
   if (!fs.existsSync(folderPath)) {
     fs.mkdirSync(folderPath);
   }
-
   const files = fs.readdirSync(folderPath);
   const tools = {};
-
   for (const file of files) {
     if (file.endsWith('.js')) {
       const moduleName = file.slice(0, -3);
       const modulePath = path.resolve(folderPath, file);
-
       try {
-        // Dynamically import the function module
         const { details, execute } = await import(`file://${modulePath}`);
         tools[moduleName] = { details, execute };
       } catch (error) {
@@ -51,33 +47,29 @@ async function getTools() {
   return tools;
 }
 
-// 2️⃣ Find the best matching tool using GPT
+// 2️⃣ Find the best matching tool using GPT, considering that if none exists it should be generated.
 async function findBestMatchingTool(userPrompt, tools) {
   if (Object.keys(tools).length === 0) return null;
-
   const toolInfo = Object.entries(tools).map(([name, tool]) => {
     return `${name}: ${tool.details.description}`;
   });
-
   const query = `
-  I have these tools:
-  ${toolInfo.join('\n')}
-  
-  A user wants: "${userPrompt}"
-  
-  Which tool name best matches their request? If none match, return "none". 
-  Return exactly one line with the tool name or "none".
-  `;
+I have these tools:
+${toolInfo.join('\n')}
 
+A user wants: "${userPrompt}"
+
+Based on the user's intent (for example, if the user said "multiply 2 and 5", it implies a multiplication function with two numeric parameters), which tool name best matches their request? If none match, return "none".
+Return exactly one line with the tool name or "none".
+  `;
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [
-        { role: 'system', content: 'You are a helpful assistant that picks the best matching tool name from the list.' },
+        { role: 'system', content: 'You are a helpful assistant that picks the best matching tool name from the list. Consider that if the function does not exist, a new one should be generated based on the user intent.' },
         { role: 'user', content: query }
       ]
     });
-
     const bestMatch = response?.choices?.[0]?.message?.content?.trim() || 'none';
     if (bestMatch === 'none' || !Object.keys(tools).includes(bestMatch)) {
       return null;
@@ -89,51 +81,71 @@ async function findBestMatchingTool(userPrompt, tools) {
   }
 }
 
-// 3️⃣ Generate a new tool using GPT and save it in /functions/
+// 3️⃣ Generate a new tool using GPT and save it in /functions/.
+// The instructions now emphasize reasoning about the user request.
 async function generateTool(toolName, toolDescription) {
+  const instructions = `
+You are a skilled JavaScript developer. A user request has been received: "${toolDescription}".
+Generate a generic JavaScript function that can fulfill the request. For instance, if the user said "multiply 2 and 5", the function should not hard-code the values but be generic, accepting two numeric parameters for multiplication.
+The function should be named "execute" and exported along with a "details" object.
+The "details" object must include:
+  - type: "function"
+  - function: an object with:
+      - name: set to "${toolName}"
+      - parameters: an object that follows the JSON Schema standard with "type": "object", "properties" for each parameter, and a "required" array listing the required parameter names.
+  - description: should be the same as "${toolDescription}".
+Format your code exactly as follows:
+
+const execute = async (/* your parameters here */) => {
+    // function implementation
+};
+
+const details = {
+    type: "function",
+    function: {
+        name: "${toolName}",
+        parameters: {
+            type: "object",
+            properties: {
+                // define properties with types and descriptions
+            },
+            required: [ /* list required parameter names */ ]
+        }
+    },
+    description: "${toolDescription}"
+};
+
+Export { execute, details };
+
+Ensure your code is valid JavaScript.
+Return only the code with no additional text.
+  `;
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [
-        { role: 'system', content: 'You are a skilled JavaScript developer. Generate a function based on user input.' },
-        {
-          role: 'user',
-          content: `Write a JavaScript function called "execute" to ${toolDescription}. 
-          The function should be formatted as follows:
-          
-          const execute = async (...) => { ... };
-
-          const details = {
-            type: "function",
-            function: {
-                name: "${toolName}",
-                parameters: { ... },
-                required: [ ... ]
-            },
-            description: "${toolDescription}"
-          };
-
-          Export both as a module.`
-        }
+        { role: 'system', content: 'You are a skilled JavaScript developer.' },
+        { role: 'user', content: instructions }
       ]
     });
-
-    const generatedCode = response?.choices?.[0]?.message?.content;
+    let generatedCode = response?.choices?.[0]?.message?.content;
     if (!generatedCode) {
       throw new Error('No code generated by GPT.');
     }
-
+    // Remove markdown code fences if present.
+    generatedCode = generatedCode.trim();
+    if (generatedCode.startsWith('```')) {
+      generatedCode = generatedCode.replace(/^```(?:javascript)?\s*/, '').replace(/\s*```$/, '');
+    }
     if (
       !generatedCode.includes('const execute') ||
       !generatedCode.includes('export { execute, details }')
     ) {
       throw new Error('Generated function is not in the expected format.');
     }
-
     const fileName = `${toolName}.js`;
     const toolPath = path.resolve(__dirname, './functions', fileName);
     fs.writeFileSync(toolPath, generatedCode);
-
     console.log(`✅ Tool ${toolName} generated and saved at ${toolPath}.`);
     return { success: true, toolName };
   } catch (error) {
@@ -142,22 +154,31 @@ async function generateTool(toolName, toolDescription) {
   }
 }
 
-// NEW: Helper function to extract parameters using GPT reasoning over the user input
+// 4️⃣ Helper function to extract parameters using GPT reasoning over the user input.
+// The prompt now stresses that the assistant should deduce the parameters from the user's intent.
 async function extractParamsFromUserPrompt(userPrompt, toolDetails) {
-  // Use the correct parameter schema and required keys from the parameters object.
+  // If the tool's parameter schema is empty, fallback to extracting numbers.
+  if (
+    !toolDetails.function.parameters ||
+    !toolDetails.function.parameters.required ||
+    toolDetails.function.parameters.required.length === 0
+  ) {
+    const numbers = userPrompt.match(/\d+(\.\d+)?/g);
+    if (numbers) return numbers.map(Number);
+    return [];
+  }
   const parameterInfo = JSON.stringify(toolDetails.function.parameters);
   const requiredParams = toolDetails.function.parameters.required.join(', ');
   const promptMessage = `
 You are a programming assistant. A user has provided the following request: "${userPrompt}".
-There is a function called "${toolDetails.function.name}" which expects parameters as described here: ${parameterInfo}.
+There is a function called "${toolDetails.function.name}" which expects parameters as described below:
+${parameterInfo}
 The required parameters, in order, are: ${requiredParams}.
-Extract the parameters from the user request and return a JSON array of argument values in the order specified.
-If a parameter is expected to be a number, return it as a number; if it's expected to be a string, return it as a string.
-For example, if the function expects a name and the user said "greet Bella", the response should be: ["Bella"].
-If the function expects two numbers and the user said "addnumber 5 and 9", the response should be: [5, 9].
+Based on the intent of the user's request (for example, if the request is "multiply 2 and 5", it means the two numbers 2 and 5), extract the parameters from the request.
+Return a JSON array of argument values in the order specified.
+If a parameter is expected to be a number, return it as a number; if a string, return it as a string.
 Output only a JSON array with no additional text.
   `;
-
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
@@ -184,8 +205,17 @@ Output only a JSON array with no additional text.
   }
 }
 
-// NEW: Helper function to finalize the parameters by reasoning how they should be used when executing the tool
+// 5️⃣ Helper function to finalize the parameters by reasoning how they should be used when executing the tool.
+// The prompt now instructs the assistant to verify and map the extracted parameters based on the intended operation.
 async function finalizeParams(extractedParams, toolDetails, userPrompt) {
+  // If the schema is empty, assume the extracted parameters are final.
+  if (
+    !toolDetails.function.parameters ||
+    !toolDetails.function.parameters.required ||
+    toolDetails.function.parameters.required.length === 0
+  ) {
+    return extractedParams;
+  }
   const parameterInfo = JSON.stringify(toolDetails.function.parameters);
   const requiredParams = toolDetails.function.parameters.required.join(', ');
   const prompt = `
@@ -195,12 +225,9 @@ Parameters: ${parameterInfo}
 Required order: ${requiredParams}
 
 The extracted parameters from the user's request "${userPrompt}" are: ${JSON.stringify(extractedParams)}.
-Please verify and finalize the parameters that should be used when calling the function.
-For example, if the function is greetUser and expects a name, ensure that ["Bella"] is used as the name.
-If the function is addNumbers and expects two numbers, ensure that the final result is a JSON array like [5, 9].
+Based on the user intent, verify and finalize the parameters that should be used when calling the function.
 Return only a JSON array with the finalized parameter values.
   `;
-
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
@@ -227,21 +254,18 @@ Return only a JSON array with the finalized parameter values.
   }
 }
 
-// 4️⃣ Main route: process user requests, pick or generate a tool, then execute
+// 6️⃣ Main route: process user requests, pick or generate a tool, then execute.
 app.post('/process-request', async (req, res) => {
   const { userPrompt } = req.body;
   if (!userPrompt) {
     return res.status(400).json({ error: 'Missing user request.' });
   }
-
-  // Load existing tools
+  // Load existing tools.
   let tools = await getTools();
-
-  // 4a. Ask GPT which tool (by name) best matches this user prompt
+  // 6a. Ask GPT which tool (by name) best matches this user prompt.
   let matchedToolName = await findBestMatchingTool(userPrompt, tools);
-
-  // 4b. If no match, generate a new tool
-  let selectedTool;
+  let currentToolDetails;
+  // 6b. If no match, generate a new tool using GPT.
   if (!matchedToolName) {
     console.log(`No matching tool found for: "${userPrompt}". Generating new tool...`);
     const newToolName = `generatedTool${Date.now()}`;
@@ -252,26 +276,23 @@ app.post('/process-request', async (req, res) => {
     tools = await getTools();
     matchedToolName = result.toolName;
   }
-
-  // 4c. Now we should have a matched or newly generated tool
-  selectedTool = tools[matchedToolName]?.execute;
-  if (!selectedTool) {
+  // 6c. Retrieve the tool's execution function and details.
+  const selectedTool = tools[matchedToolName]?.execute;
+  currentToolDetails = tools[matchedToolName]?.details;
+  if (!selectedTool || !currentToolDetails) {
     return res.status(500).json({ error: 'Tool not found after generation.' });
   }
-
-  // 4d. Extract parameters using GPT reasoning over the user input
-  let extractedParams = await extractParamsFromUserPrompt(userPrompt, tools[matchedToolName].details);
+  // 6d. Extract parameters using GPT reasoning over the user input using the current tool's details.
+  let extractedParams = await extractParamsFromUserPrompt(userPrompt, currentToolDetails);
   if (!Array.isArray(extractedParams)) {
     extractedParams = [extractedParams];
   }
-  
-  // 4d2. Finalize the parameters using a new GPT assistant that reasons how they should be used
-  let finalParams = await finalizeParams(extractedParams, tools[matchedToolName].details, userPrompt);
+  // 6e. Finalize the parameters using a GPT assistant that reasons how they should be used.
+  let finalParams = await finalizeParams(extractedParams, currentToolDetails, userPrompt);
   if (!Array.isArray(finalParams)) {
     finalParams = [finalParams];
   }
-
-  // 4e. Execute the tool with the finalized parameters and ensure a valid JSON response
+  // 6f. Execute the tool with the finalized parameters and ensure a valid JSON response.
   try {
     const result = await selectedTool(...finalParams);
     console.log(`Executed tool "${matchedToolName}" with result:`, result);
@@ -285,7 +306,6 @@ app.post('/process-request', async (req, res) => {
   }
 });
 
-// Start the server
 const PORT = 3000;
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);

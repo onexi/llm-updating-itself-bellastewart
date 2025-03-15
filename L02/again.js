@@ -47,26 +47,26 @@ async function getTools() {
   return tools;
 }
 
-// 2️⃣ Find the best matching tool using GPT
+// 2️⃣ Find the best matching tool using GPT, considering that if none exists it should be generated.
 async function findBestMatchingTool(userPrompt, tools) {
   if (Object.keys(tools).length === 0) return null;
   const toolInfo = Object.entries(tools).map(([name, tool]) => {
     return `${name}: ${tool.details.description}`;
   });
   const query = `
-  I have these tools:
-  ${toolInfo.join('\n')}
-  
-  A user wants: "${userPrompt}"
-  
-  Which tool name best matches their request? If none match, return "none".
-  Return exactly one line with the tool name or "none".
+I have these tools:
+${toolInfo.join('\n')}
+
+A user wants: "${userPrompt}"
+
+Based on the user's intent (for example, if the user said "multiply 2 and 5", it implies a multiplication function with two numeric parameters), which tool name best matches their request? If none match, return "none".
+Return exactly one line with the tool name or "none".
   `;
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [
-        { role: 'system', content: 'You are a helpful assistant that picks the best matching tool name from the list.' },
+        { role: 'system', content: 'You are a helpful assistant that picks the best matching tool name from the list. Consider that if the function does not exist, a new one should be generated based on the user intent.' },
         { role: 'user', content: query }
       ]
     });
@@ -81,13 +81,12 @@ async function findBestMatchingTool(userPrompt, tools) {
   }
 }
 
-// 3️⃣ Generate a new tool using GPT and save it in /functions/
-// This function asks GPT to generate a generic function that fulfills the user request.
+// 3️⃣ Generate a new tool using GPT and save it in /functions/.
+// The instructions now emphasize reasoning about the user request.
 async function generateTool(toolName, toolDescription) {
   const instructions = `
-You are a skilled JavaScript developer.
-Generate a generic JavaScript function that fulfills the following request: "${toolDescription}".
-The function should be as general as possible – it must not hard-code any specific values from the request, but work with input parameters.
+You are a skilled JavaScript developer. A user request has been received: "${toolDescription}".
+Generate a generic JavaScript function that can fulfill the request. For instance, if the user said "multiply 2 and 5", the function should not hard-code the values but be generic, accepting two numeric parameters for multiplication.
 The function should be named "execute" and exported along with a "details" object.
 The "details" object must include:
   - type: "function"
@@ -156,6 +155,7 @@ Return only the code with no additional text.
 }
 
 // 4️⃣ Helper function to extract parameters using GPT reasoning over the user input.
+// The prompt now stresses that the assistant should deduce the parameters from the user's intent.
 async function extractParamsFromUserPrompt(userPrompt, toolDetails) {
   // If the tool's parameter schema is empty, fallback to extracting numbers.
   if (
@@ -173,12 +173,8 @@ async function extractParamsFromUserPrompt(userPrompt, toolDetails) {
 You are a programming assistant. A user has provided the following request: "${userPrompt}".
 There is a function called "${toolDetails.function.name}" which expects parameters as described below:
 ${parameterInfo}
-The required parameters, in order, are: ${requiredParams}.
-Extract the parameters from the user request and return a JSON array of argument values in the order specified.
-If a parameter is expected to be a number, return it as a number; if a string, return it as a string.
-For example, if the function expects a name and the user said "greet Bella", return: ["Bella"].
-If the function expects two numbers and the user said "addnumber 5 and 9", return: [5, 9].
-Output only a JSON array with no additional text.
+The required parameters, in order, are: ${requiredParams}. Based on the intent of the user's request (for example, if the request is "multiply 2 and 5" or "add 2 and 3 and 4", extract all the numbers mentioned), identify and extract each parameter in sequence. For each parameter, if a number is expected, return it as a number; if a string is expected, return it as a string, and so on. If multiple numbers are expected, return it as a series of numbers. If multiple strings are expected, return it as a series of strings.
+Return only a JSON array of argument values in the specified order with no additional text.
   `;
   try {
     const response = await openai.chat.completions.create({
@@ -207,6 +203,7 @@ Output only a JSON array with no additional text.
 }
 
 // 5️⃣ Helper function to finalize the parameters by reasoning how they should be used when executing the tool.
+// The prompt now instructs the assistant to verify and map the extracted parameters based on the intended operation.
 async function finalizeParams(extractedParams, toolDetails, userPrompt) {
   // If the schema is empty, assume the extracted parameters are final.
   if (
@@ -225,7 +222,7 @@ Parameters: ${parameterInfo}
 Required order: ${requiredParams}
 
 The extracted parameters from the user's request "${userPrompt}" are: ${JSON.stringify(extractedParams)}.
-Please verify and finalize the parameters that should be used when calling the function.
+Based on the user intent, verify and finalize the parameters that should be used when calling the function.
 Return only a JSON array with the finalized parameter values.
   `;
   try {
