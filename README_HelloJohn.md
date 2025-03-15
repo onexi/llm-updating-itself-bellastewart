@@ -5,7 +5,7 @@ Call Function from LLM
 
 Hello John -- I worked on this for 6+ hours and couldn't quite get it to be perfectly functional. I think the prompt engineering is quite difficult - for some reason it's not extracting the parametesr that well by interpreting the user's input. 
 
-Currently it is succesful in
+new_server.js is currently succesful in
 
 (1) Interpreting that an existing function can be used, and executing this. 
 - adding numbers
